@@ -67,6 +67,7 @@ class Trainer:
         self.log_tb = args.log_tensorboard
         self.probe_model = probe_model
 
+
         if distributed_args is not None:
             self.is_distributed = True
             self.world_size = distributed_args["world_size"]
@@ -158,20 +159,24 @@ class Trainer:
         Training Loop
         """
 
+    # Model Initialization and Device Setup
         self.context_encoder.to(self.device)
         self.target_encoder.to(self.device)
         self.predictors.to(self.device)
 
+    # Test Mode Handling
         if self.args.test:
             self.num_epoch = 1
             self.args.mock = True
-
+    
+    # Training Loop Setup
         while self.epoch < self.num_epoch:
             collapse_metrics = None
             linear_probe_metric = 0
             if self.probe_cadence > 0 and self.epoch % self.probe_cadence == 0:
                 print(f"Running probe at epoch {self.epoch}")
-
+    
+    # Online Dataset Preparation
                 online_dataset_args: OnlineDatasetArgs = {
                     "data_set": self.dataset.dataset_name,
                     "data_path": self.args.data_path,
@@ -192,7 +197,8 @@ class Trainer:
                     self.target_encoder,
                 )
                 online_dataset.load()
-
+    
+    # Visualization and Collapse Metrics Calculation
                 X = online_dataset.X
 
                 rnd_sample = np.random.randint(0, X.shape[0])
@@ -243,7 +249,8 @@ class Trainer:
 
                 collapse_metrics["KL"] = np.mean(collapse_metrics["KL"])
                 collapse_metrics["euclidean"] = np.mean(collapse_metrics["euclidean"])
-
+    
+    # Probing Model Setup
                 model_class: BaseModel = MODEL_NAME_TO_MODEL_MAP[self.probe_model]
 
                 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -327,7 +334,8 @@ class Trainer:
                 trainer.test(model, datamodule=datamodule)
 
                 linear_probe_metric = val_metrics[0][f"{self.args.data_set}_val_score"]
-
+    
+    # Main Training Loop
             start_time = datetime.now()
             to_print = f"Training epoch: {self.epoch+1}/{self.num_epoch}"
             if self.is_main_process:
@@ -335,7 +343,7 @@ class Trainer:
 
             if self.is_distributed:
                 self.dataloader.set_epoch(self.epoch)
-            total_loss = torch.zeros(1, device=self.device)
+            total_loss = torch.zeros(1, device=self.device)                                 # create tensor filled by 0, size 1
 
             for itr, (batch, masks_enc, masks_pred) in enumerate(tqdm(self.dataloader)):
 
@@ -360,20 +368,53 @@ class Trainer:
                     z = self.context_encoder(batch, masks_enc)
                     _debug_values(z[0].T, "z[0] after context_encoder")
 
-                    if self.args.pred_type == "mlp":
-                        z = z.view(z.size(0), -1)  # flatten
-                        z = self.predictors(z, masks_pred.transpose(0, 1))
-                        loss = torch.zeros(1, device=self.device)
+                # # Loss function
+                    # if self.args.pred_type == "mlp":
+                #         z = z.view(z.size(0), -1)  # flatten
+                #         z = self.predictors(z, masks_pred.transpose(0, 1))
+                #         loss = torch.zeros(1, device=self.device)
+                #         for z_, h_ in zip(z, h):
+                #             loss += self.loss_fn(z_, h_)
+
+                #     else:  # based on the approach of I-JEPA
+                #         z = self.predictors(z, masks_enc, masks_pred)
+                #         _debug_values(z[0].T, "z[0] after predictors")
+                #         loss = self.loss_fn(z, h)
+
+                #     loss = AllReduce.apply(loss)
+
+                # DU: Apply hard negative mining to loss function 
+                    if self.args.pred_type == 'mlp':
+                        z = z.view(z.size(0), -1) 
+                        z = self.predictors(z, masks_pred.transpose(0,1))
+
+                        losses = []
                         for z_, h_ in zip(z, h):
-                            loss += self.loss_fn(z_, h_)
+                            loss_value = self.loss_fn(z_, h_)  
+                            losses.append(loss_value)
+                        # Convert list to tensor
+                        losses = torch.stack(losses)
 
-                    else:  # based on the approach of I-JEPA
+                        # Tạo trọng số động cho mẫu khó (hard negatives)
+                        weights = torch.exp(losses / losses.mean())  # Normalize importance
+                        weights = weights / weights.sum()  # Chuẩn hóa trọng số
+                        
+                        # Áp dụng trọng số vào loss function
+                        loss = (weights * losses).sum()
+                    else:
                         z = self.predictors(z, masks_enc, masks_pred)
-                        _debug_values(z[0].T, "z[0] after predictors")
                         loss = self.loss_fn(z, h)
+                # DU: Save hard negative back to the traning set
+                # Thêm phần lưu Hard Negatives
+                hard_samples = batch[torch.where(losses > losses.mean())[0]]  # Chọn samples có loss cao hơn trung bình
+                self.hard_negative_buffer.extend(hard_samples.cpu().detach().tolist())
 
-                    loss = AllReduce.apply(loss)
+                # Nếu buffer quá lớn, xóa bớt
+                if len(self.hard_negative_buffer) > self.args.max_hard_samples:
+                    self.hard_negative_buffer = self.hard_negative_buffer[-self.args.max_hard_samples:]
 
+    
+    #  Backpropagation and Optimization
                     if self.args.model_amp:
                         self.scaler.scale(loss).backward()
                         self.scaler.step(self.optimizer)
@@ -417,7 +458,8 @@ class Trainer:
                             else torch.tensor([])
                         )
                         pred_grads = pred_grads.cpu().detach().numpy()
-
+    
+    # Gradient Logging (WandB)
                         wandb.log(
                             {
                                 "context_encoder_grads": wandb.Histogram(ctx_grads),
@@ -432,7 +474,8 @@ class Trainer:
                             f"Train/loss", loss.item(), itr * (self.epoch + 1)
                         )
                     total_loss += loss
-
+    
+    # Momentum Update of Target Encoder
                     # Step 3. momentum update of target encoder
                     with torch.no_grad():
                         m = next(self.momentum_scheduler)
