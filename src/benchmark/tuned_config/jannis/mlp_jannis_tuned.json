@@ -10,7 +10,7 @@
     "exp_eta_min": 0,
     "exp_lr": 0.0007306714468183099,
     "exp_patience": 16,
-    "exp_train_total_epochs": 200,
+    "exp_train_total_epochs": 30,
     "exp_weight_decay": 0.00000209376366726986,
     "final_lr": 0,
     "hidden_dim": 498,

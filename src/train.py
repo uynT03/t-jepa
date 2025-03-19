@@ -4,7 +4,6 @@ import torchvision
 import pytorch_lightning as pl
 import os
 from datetime import datetime
-
 import numpy as np
 from tabulate import tabulate
 import torch
@@ -66,7 +65,7 @@ class Trainer:
         self.data_loader_nprocs = self.args.data_loader_nprocs
         self.log_tb = args.log_tensorboard
         self.probe_model = probe_model
-
+        self.hard_negative_buffer = []
 
         if distributed_args is not None:
             self.is_distributed = True
@@ -85,7 +84,7 @@ class Trainer:
         self.momentum_scheduler = momentum_scheduler
         self.optimizer = optimizer
         self.scaler = scaler
-        self.loss_fn = torch.nn.MSELoss()  # F.smooth_l1_loss
+        self.loss_fn = nn.MSELoss()  # F.smooth_l1_loss
 
         self.dataset = torch_dataset
         self.cardinalities = self.dataset.cardinalities
@@ -152,6 +151,60 @@ class Trainer:
             "num_epochs": self.num_epoch,
         }
 
+    def save_model(self, path=None, filename=None, save_optimizer=False):
+        """
+        Save the model components as a single .pt file.
+
+        Parameters:
+        path (str, optional): Directory path to save the model.
+                              If None, saves to self.checkpoint_dir.
+        filename (str, optional): Name of the saved file.
+                                 If None, uses 'model_epoch_{self.epoch}.pt'.
+        save_optimizer (bool): Whether to save optimizer state as well.
+
+        Returns:
+        str: Path to the saved model file.
+        """
+        if path is None:
+            path = self.checkpoint_dir
+
+        if filename is None:
+            filename = f"model_epoch_{self.epoch}.pt"
+
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        save_path = os.path.join(path, filename)
+
+        # Create dictionary with model components
+        model_dict = {
+            'context_encoder_state_dict': self.context_encoder.state_dict(),
+            'target_encoder_state_dict': self.target_encoder.state_dict(),
+            'predictors_state_dict': self.predictors.state_dict(),
+            'epoch': self.epoch,
+            'args': self.args,
+            'job_name': self.job_name
+        }
+
+        # Optionally save optimizer state
+        if save_optimizer:
+            model_dict['optimizer_state_dict'] = self.optimizer.state_dict()
+            if self.scheduler is not None:
+                model_dict['scheduler_state_dict'] = self.scheduler.state_dict()
+            if self.weight_decay_scheduler is not None:
+                model_dict['weight_decay_scheduler_state_dict'] = self.weight_decay_scheduler.state_dict()
+            if self.scaler is not None:
+                model_dict['scaler_state_dict'] = self.scaler.state_dict()
+
+        # Save to disk
+        torch.save(model_dict, save_path)
+
+        if self.is_main_process:
+            print(f"Model saved to {save_path}")
+
+        return save_path
+
+
     def train(
         self,
     ):
@@ -159,24 +212,20 @@ class Trainer:
         Training Loop
         """
 
-    # Model Initialization and Device Setup
         self.context_encoder.to(self.device)
         self.target_encoder.to(self.device)
         self.predictors.to(self.device)
 
-    # Test Mode Handling
         if self.args.test:
             self.num_epoch = 1
             self.args.mock = True
-    
-    # Training Loop Setup
+
         while self.epoch < self.num_epoch:
             collapse_metrics = None
             linear_probe_metric = 0
             if self.probe_cadence > 0 and self.epoch % self.probe_cadence == 0:
                 print(f"Running probe at epoch {self.epoch}")
-    
-    # Online Dataset Preparation
+
                 online_dataset_args: OnlineDatasetArgs = {
                     "data_set": self.dataset.dataset_name,
                     "data_path": self.args.data_path,
@@ -197,8 +246,7 @@ class Trainer:
                     self.target_encoder,
                 )
                 online_dataset.load()
-    
-    # Visualization and Collapse Metrics Calculation
+
                 X = online_dataset.X
 
                 rnd_sample = np.random.randint(0, X.shape[0])
@@ -249,8 +297,7 @@ class Trainer:
 
                 collapse_metrics["KL"] = np.mean(collapse_metrics["KL"])
                 collapse_metrics["euclidean"] = np.mean(collapse_metrics["euclidean"])
-    
-    # Probing Model Setup
+
                 model_class: BaseModel = MODEL_NAME_TO_MODEL_MAP[self.probe_model]
 
                 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -262,9 +309,10 @@ class Trainer:
                         "batch_size": 128,
                         "task_type": online_dataset.task_type,
                         "using_embedding": True,
-                        "exp_train_total_epochs": 50 if not self.args.test else 1,
+                        "exp_train_total_epochs": 200 if not self.args.test else 1, #DU: let epoch = 1 to debug
                         "model_name": self.probe_model,
                         "dataset_name": online_dataset_args.data_set,
+                        "exp_patience": 20,
                         "exp_patience": 20,
                         "n_cls_tokens": self.args.n_cls_tokens,
                     }
@@ -315,6 +363,8 @@ class Trainer:
                 )
 
                 loss_fn = get_loss_from_task(dataset_args.task_type)
+                # loss_fn = torch.nn.MSELoss()
+                # loss_fn = VICRegLoss()
                 dataset_args = {**vars(dataset_args), **vars(model_args)}
                 model = model_class(loss=loss_fn, **dataset_args)
                 summary(model, input_size=model_args.summary_input)
@@ -334,8 +384,7 @@ class Trainer:
                 trainer.test(model, datamodule=datamodule)
 
                 linear_probe_metric = val_metrics[0][f"{self.args.data_set}_val_score"]
-    
-    # Main Training Loop
+
             start_time = datetime.now()
             to_print = f"Training epoch: {self.epoch+1}/{self.num_epoch}"
             if self.is_main_process:
@@ -343,7 +392,7 @@ class Trainer:
 
             if self.is_distributed:
                 self.dataloader.set_epoch(self.epoch)
-            total_loss = torch.zeros(1, device=self.device)                                 # create tensor filled by 0, size 1
+            total_loss = torch.zeros(1, device=self.device)
 
             for itr, (batch, masks_enc, masks_pred) in enumerate(tqdm(self.dataloader)):
 
@@ -368,53 +417,75 @@ class Trainer:
                     z = self.context_encoder(batch, masks_enc)
                     _debug_values(z[0].T, "z[0] after context_encoder")
 
-                # # Loss function
-                    # if self.args.pred_type == "mlp":
-                #         z = z.view(z.size(0), -1)  # flatten
-                #         z = self.predictors(z, masks_pred.transpose(0, 1))
-                #         loss = torch.zeros(1, device=self.device)
-                #         for z_, h_ in zip(z, h):
-                #             loss += self.loss_fn(z_, h_)
+                    # Loss function
+                    # # Loss function
+                    #     if self.args.pred_type == "mlp":
+                    #         z = z.view(z.size(0), -1)  # flatten
+                    #         z = self.predictors(z, masks_pred.transpose(0, 1))
+                    #         loss = torch.zeros(1, device=self.device)
+                    #         for z_, h_ in zip(z, h):
+                    #             loss += self.loss_fn(z_, h_)
 
-                #     else:  # based on the approach of I-JEPA
-                #         z = self.predictors(z, masks_enc, masks_pred)
-                #         _debug_values(z[0].T, "z[0] after predictors")
-                #         loss = self.loss_fn(z, h)
+                    #     else:  # based on the approach of I-JEPA
+                    #         z = self.predictors(z, masks_enc, masks_pred)
+                    #         _debug_values(z[0].T, "z[0] after predictors")
+                    #         loss = self.loss_fn(z, h)
 
-                #     loss = AllReduce.apply(loss)
+                    #     loss = AllReduce.apply(loss)
 
-                # DU: Apply hard negative mining to loss function 
-                    if self.args.pred_type == 'mlp':
-                        z = z.view(z.size(0), -1) 
-                        z = self.predictors(z, masks_pred.transpose(0,1))
+                    # DU: Apply hard negative mining to loss function
+                    losses = torch.zeros(batch.size(0), device=self.device)  # Initialize with zeros
 
-                        losses = []
-                        for z_, h_ in zip(z, h):
-                            loss_value = self.loss_fn(z_, h_)  
-                            losses.append(loss_value)
-                        # Convert list to tensor
-                        losses = torch.stack(losses)
-
-                        # Tạo trọng số động cho mẫu khó (hard negatives)
-                        weights = torch.exp(losses / losses.mean())  # Normalize importance
-                        weights = weights / weights.sum()  # Chuẩn hóa trọng số
-                        
-                        # Áp dụng trọng số vào loss function
-                        loss = (weights * losses).sum()
-                    else:
+                    # Loss function
+                    if self.args.pred_type == "mlp":
+                        z = z.view(z.size(0), -1)  # Flatten for MLP
+                        if isinstance(masks_pred, list):
+                            masks_pred = torch.stack(masks_pred)
+                        z = self.predictors(z, masks_pred.transpose(0, 1))
+                    else:  # Transformer-based I-JEPA approach
                         z = self.predictors(z, masks_enc, masks_pred)
-                        loss = self.loss_fn(z, h)
-                # DU: Save hard negative back to the traning set
-                # Thêm phần lưu Hard Negatives
-                hard_samples = batch[torch.where(losses > losses.mean())[0]]  # Chọn samples có loss cao hơn trung bình
-                self.hard_negative_buffer.extend(hard_samples.cpu().detach().tolist())
 
-                # Nếu buffer quá lớn, xóa bớt
-                if len(self.hard_negative_buffer) > self.args.max_hard_samples:
-                    self.hard_negative_buffer = self.hard_negative_buffer[-self.args.max_hard_samples:]
+                    # Compute per-sample loss
+                    losses = torch.stack([self.loss_fn(z_, h_) for z_, h_ in zip(z, h)])
 
-    
-    #  Backpropagation and Optimization
+                    # Hard Negative Mining
+                    weights = torch.exp(losses / losses.mean())
+                    weights = (weights - torch.mean(weights))/torch.std(weights)
+
+                    # Apply weighting to loss
+                    loss = (weights * losses).sum()
+
+                    # Distributed training adjustment
+                    loss = AllReduce.apply(loss)
+
+                    # DU: Save hard negative back to the training set
+                    assert not torch.isnan(losses).any(), "NaN detected in losses!"
+                    assert not torch.isinf(losses).any(), "Inf detected in losses!"
+
+                    # Thêm phần lưu Hard Negatives
+                    hard_indices = torch.where(losses > losses.mean())[0]
+
+                    # Ensure indices are valid
+                    hard_indices = hard_indices[hard_indices < batch.shape[0]]  # Remove out-of-bounds indices
+
+                    if hard_indices.numel() > 0:  # Check if not empty
+                        # print(f"Batch size: {batch.shape[0]}, Hard indices: {hard_indices}")
+                        assert hard_indices.max() < batch.shape[0], "Index out of bounds!"
+                        hard_samples = batch[hard_indices]
+                        self.hard_negative_buffer.extend(hard_samples.cpu().detach().tolist())
+
+                    if not hasattr(self.args, "max_hard_samples"):
+                        self.args.max_hard_samples = 2048  # Set a default value
+
+                    # Nếu buffer quá lớn, xóa bớt
+                    if len(self.hard_negative_buffer) > self.args.max_hard_samples:
+                        self.hard_negative_buffer = self.hard_negative_buffer[-self.args.max_hard_samples:]
+
+                    # Add back to training set
+                    if self.hard_negative_buffer:
+                        self.dataloader.dataset.ConcatDataset(self.hard_negative_buffer)
+                        self.hard_negative_buffer.clear()
+
                     if self.args.model_amp:
                         self.scaler.scale(loss).backward()
                         self.scaler.step(self.optimizer)
@@ -458,8 +529,7 @@ class Trainer:
                             else torch.tensor([])
                         )
                         pred_grads = pred_grads.cpu().detach().numpy()
-    
-    # Gradient Logging (WandB)
+
                         wandb.log(
                             {
                                 "context_encoder_grads": wandb.Histogram(ctx_grads),
@@ -474,8 +544,7 @@ class Trainer:
                             f"Train/loss", loss.item(), itr * (self.epoch + 1)
                         )
                     total_loss += loss
-    
-    # Momentum Update of Target Encoder
+
                     # Step 3. momentum update of target encoder
                     with torch.no_grad():
                         m = next(self.momentum_scheduler)
@@ -523,6 +592,8 @@ class Trainer:
                 log_dict.update(collapse_metrics)
             wandb.log(log_dict)
 
+
+            #Added *extra_values to capture addition values returned here
             (
                 early_stop_signal,
                 self.context_encoder,
@@ -532,6 +603,7 @@ class Trainer:
                 self.scaler,
                 self.scheduler,
                 self.weight_decay_scheduler,
+                *extra_values,
             ) = self.early_stop_counter.update(**args_early_stop)
 
             if early_stop_signal == EarlyStopSignal.STOP:
@@ -548,6 +620,11 @@ class Trainer:
         # )
         # )
         self.training_is_over = True
+
+
+        #save model as ".pt" file to then be recovered and generate embeddings
+        self.save_model(path = "saved_model", filename="jannis_model.pt")
+
         if self.is_main_process:
             self.avg_time = self.total_train_time
 

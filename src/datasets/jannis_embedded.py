@@ -34,8 +34,8 @@ class JannisEmbedded(BaseDataset):
         self.task_type = TASK_TYPE.MULTI_CLASS
 
     def load(self):
-
-        embedded_data = np.load(os.path.join(self.data_path, self.tmp_file_names[0]))
+        embedded_data = np.load('/home/group2/DongUyen/t-jepa/datasets/jannis_embeddings.npy')
+        # embedded_data = np.load(os.path.join(self.data_path, self.tmp_file_names[0]))
 
         orig_data, _ = arff.loadarff(
             os.path.join(self.data_path, self.tmp_file_names[1])
